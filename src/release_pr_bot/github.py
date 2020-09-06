@@ -1,10 +1,18 @@
+import asyncio
+from typing import Any, Dict, List
+import http
+import base64
+import fnmatch
 
 from gidgethub.routing import Router
 from sanic.log import logger
 from sanic import Sanic
 from gidgethub.abc import GitHubAPI
 from gidgethub.sansio import Event
+from gidgethub import BadRequest
 import aiohttp
+from pydantic import BaseModel
+import yaml
 
 from .semver import (
     evaluate_version_bump,
@@ -27,6 +35,56 @@ class Commit():
     message = message.replace("\r", "\n")
     return message
 
+class InstallConfig(BaseModel):
+    branches: List[str] = []
+    labels: List[str] = ["release"]
+
+
+async def get_installation_config(gh: GitHubAPI, repo_url: str) -> InstallConfig:
+    url = f"{repo_url}/contents/.github/release_pr.yml?ref=master"
+    logger.debug("Getting installation config from: %s", url)
+    try:
+      res = await gh.getitem(url)
+      assert res["encoding"] == "base64"
+      content = base64.b64decode(res["content"]).decode("utf8").strip()
+      data = yaml.safe_load(content)
+      return InstallConfig(**data)
+    except BadRequest as e:
+      if e.status_code == http.HTTPStatus.NOT_FOUND:
+        logger.debug("No config found, use defaults")
+        return InstallConfig()
+      raise e
+
+def should_act_on_pr(event: Dict[str, Any], config: InstallConfig, app: Any) -> bool:
+    pr = event.data["pull_request"]
+    action = event.data["action"]
+
+    if action not in ("opened", "edited", "synchronize", "labeled"):
+        logger.debug("Ignoring action %s", action)
+        return False
+
+    if action == "edited" and event.data["sender"]["type"] == "Bot" and event.data["sender"]["login"].startswith(app.app_info["slug"]):
+        logger.debug("Event triggered by me, %s. Skipping!", app.app_info["slug"])
+        return False
+
+    if pr["merged"] == True:
+        logger.debug("PR is already merged")
+        return False
+
+    target_branch = pr["base"]["ref"]
+    branch_ok = any((fnmatch.fnmatch(target_branch, p) for p in config.branches))
+    logger.debug("Target branch '%s' matches any pattern %s: %s", target_branch, config.branches, branch_ok)
+    
+    labels = [label["name"] for label in pr["labels"]]
+    has_label = any((l in config.labels for l in labels))
+    logger.debug("PR labels: %s", labels)
+    logger.debug("PR has any of configured labels %s: %s", config.labels, has_label)
+
+    if not branch_ok and not has_label:
+        return False
+
+    return True
+
 def create_router():
     router = Router()
 
@@ -36,21 +94,19 @@ def create_router():
         pr = event.data["pull_request"]
         logger.debug("Received pull_request event on PR%d", pr["number"])
 
+        action = event.data["action"]
+        logger.debug("Action: %s", action)
+
         repo_url = event.data["repository"]["url"]
         logger.debug("Repo url is %s", repo_url)
 
-        action = event.data["action"]
-        if action not in ("opened", "edited", "synchronize"):
-            logger.debug("Ignoring action %s", action)
-            return
+        config = await get_installation_config(gh, repo_url)
+        logger.debug("Config: %s", config)
 
-        if action == "edited" and event.data["sender"]["type"] == "Bot":
-            logger.debug("Event triggered by bot, skipping")
-            return
+        if not should_act_on_pr(event, config, app):
+          return
 
-        if pr["merged"] == True:
-            logger.debug("PR is already merged")
-            return
+
 
         # explicit get on PR to trigger merge commit if available
         merge_commit_sha = None
@@ -60,7 +116,7 @@ def create_router():
                 merge_commit_sha = updated_pr["merge_commit_sha"]
                 pr = updated_pr
                 break
-            await aiohttp.sleep(app.config.PR_GET_SLEEP)
+            await asyncio.sleep(app.config.PR_GET_SLEEP)
 
         if merge_commit_sha is None:
             logger.debug(

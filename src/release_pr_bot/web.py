@@ -3,7 +3,7 @@ import logging
 from sanic import Sanic, response
 import aiohttp
 from gidgethub import sansio
-from gidgethub.apps import get_installation_access_token
+from gidgethub.apps import get_installation_access_token, get_jwt
 from gidgethub import aiohttp as gh_aiohttp
 import cachetools
 from sanic.log import logger
@@ -27,6 +27,11 @@ def create_app():
     async def init(app, loop):
         logger.debug("Creating aiohttp session")
         app.aiohttp_session = aiohttp.ClientSession(loop=loop)
+
+        gh = gh_aiohttp.GitHubAPI(app.aiohttp_session, __name__)
+        jwt = get_jwt(app_id=app.config.APP_ID, private_key=app.config.PRIVATE_KEY)
+        app_info = await gh.getitem("/app", jwt=jwt)
+        app.app_info = app_info
 
     @app.route("/")
     async def index(request):
