@@ -35,6 +35,9 @@ class Commit():
     message = message.replace("\r", "\n")
     return message
 
+  def __str__(self):
+    return f"Commit(sha='{self.sha[:8]}', message='{self.message}')"
+
 class InstallConfig(BaseModel):
     branches: List[str] = []
     labels: List[str] = ["release"]
@@ -85,6 +88,9 @@ def should_act_on_pr(event: Dict[str, Any], config: InstallConfig, app: Any) -> 
 
     return True
 
+async def post_error(gh: GitHubAPI, pr: dict, error: str) -> None:
+    await gh.post(pr["url"], data={"body": f":warning: **{error}**"})
+
 def create_router():
     router = Router()
 
@@ -126,22 +132,46 @@ def create_router():
 
         logger.debug("Merge commit sha is %s", merge_commit_sha)
 
-        base_sha = pr["base"]["sha"]
+        # base_sha = pr["base"]["sha"]
         base_ref = pr["base"]["ref"]
-        logger.debug("Base sha is %s", base_sha)
+        logger.debug("Base ref is %s", base_ref)
+        current_version = await get_current_version(gh, repo_url, base_ref)
+        current_tag = f"v{current_version}"
+        logger.debug("Current version is: %s", current_version)
 
-        commits_iter = gh.getiter(f"{repo_url}/commits", {"sha": merge_commit_sha})
+        all_tags = await gh.getitem(f"{repo_url}/tags")
+        current_version_sha = None
+        for tag in all_tags:
+            if tag["name"] != current_tag:
+                continue
+            current_version_sha = tag["commit"]["sha"]
+            break
+
+        if current_version_sha is None:
+            logger.error("Failed to find sha for current tag %s", current_tag)
+            await post_error(gh, pr, f"Failed to find sha for current tag '{current_tag}'")
+            return
+
+        commits_iter = gh.getiter(f"{repo_url}/commits?sha={merge_commit_sha}")
 
         commits = []
+        did_find_last_version = False
         async for commit in commits_iter:
             # logger.debug("%s", commit)
-            if commit["sha"] == base_sha:
+            if commit["sha"] == current_version_sha:
+                did_find_last_version = True
                 break
             commit_message = commit["commit"]["message"]
             commit_hash = commit["sha"]
             commits.append(Commit(commit_hash, commit_message))
             if len(commits) > app.config.MAX_COMMIT_NUMBER:
                 raise RuntimeError("Too many commits to enumerate")
+              
+        if not did_find_last_version:
+            msg = f"Unable to find commit for last version {current_tag} [{current_version_sha[:8]}], unable to generate changelog"
+            logger.error(msg)
+            await post_error(gh, pr, msg)
+            return
 
         logger.debug(
             "Found %d commits between merge commit and branch base", len(commits)
@@ -149,11 +179,19 @@ def create_router():
 
         bump = evaluate_version_bump(commits)
 
-        current_version = await get_current_version(gh, repo_url, base_ref)
-        logger.debug("Current version is: %s", current_version)
         logger.debug("Have bump: %s", bump)
         next_version = get_new_version(current_version, bump)
         logger.debug("Next version is: %s", next_version)
+
+        existing_release = None
+        try:
+            existing_release = await gh.getitem(f"{repo_url}/releases/tags/v{next_version}")
+            logger.debug("Existing release found!")
+        except BadRequest as e:
+            if e.status_code == http.HTTPStatus.NOT_FOUND:
+                pass # this is what we want
+            else:
+                raise e
 
         changelog = generate_changelog(commits)
         md = markdown_changelog(
@@ -163,6 +201,16 @@ def create_router():
         )
 
         body = ""
+
+        if existing_release is not None:
+          if current_version == next_version:
+              body += ":no_entry_sign: Merging this will not result in a new version (no `fix`, `feat` or breaking changes). I recommend **delaying** this PR until more changes accumulate."
+
+          else:
+              body += f":warning: **WARNING: A release for {next_version} already exists [here]({existing_release['html_url']})** :warning:"
+              body += "\n"
+              body += ":no_entry_sign: I recommend to **NOT** merge this and double check the target branch!"
+        body += "\n\n"
 
         body += f"# {current_version} -> {next_version}"
 

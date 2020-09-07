@@ -24,7 +24,9 @@ def evaluate_version_bump(commits: List["Commit"], commit_parser=_default_parser
     changes = []
     commit_count = 0
 
+    logger.debug("Processing commits to determine bump:")
     for commit in commits:
+        logger.debug("- %s", commit)
         commit_count += 1
         # Attempt to parse this commit using the currently-configured parser
         try:
@@ -63,7 +65,9 @@ def generate_changelog(commits, commit_parser=_default_parser) -> dict:
     # Additional sections will be added as new types are encountered
     changes: dict = {"breaking": []}
 
+    logger.debug("Making changelog:")
     for commit in commits:
+        logger.debug("- %s", commit)
         try:
             message: ParsedCommit = commit_parser(commit.message)
             if message.type not in changes:
@@ -98,6 +102,8 @@ def markdown_changelog(
     output = f"## v{version}\n" if header else ""
 
     for section, items in changelog.items():
+        if len(items) == 0:
+            continue
         # Add a header for this section
         output += "\n### {0}\n".format(section.capitalize())
 
